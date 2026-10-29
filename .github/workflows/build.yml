@@ -1,0 +1,404 @@
+name: NewPipe + Speed Limit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Latest stable NewPipe tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api repos/TeamNewPipe/NewPipe/releases/latest --jq .tag_name || true)
+          if [ -z "$TAG" ]; then
+            TAG=$(git ls-remote --tags --refs https://github.com/TeamNewPipe/NewPipe.git 'v*' | sed 's#.*/##' | sort -V | tail -n1)
+          fi
+          echo "Using NewPipe $TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Clone NewPipe
+        run: git clone --depth 1 --branch "$TAG" https://github.com/TeamNewPipe/NewPipe.git newpipe
+
+      - name: Pick JDK
+        id: jdk
+        run: |
+          V=17
+          if grep -rqsE 'JVM_21|VERSION_21|jvmToolchain\(21\)|JavaLanguageVersion\.of\(21\)' newpipe --include='*.gradle' --include='*.kts' --include='*.toml'; then V=21; fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.jdk.outputs.v }}
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ env.TAG }}
+          restore-keys: gradle-
+
+      # Same signing key every build so you can update over the previous install
+      - uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
+      - name: Ensure debug keystore
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Inject speed limiter
+        run: |
+          D=newpipe/app/src/main/java/us/shandian/giga/get
+          mkdir -p "$D"
+
+          cat > "$D/SpeedLimiter.kt" <<'EOF'
+          package us.shandian.giga.get
+
+          import android.app.Application
+          import android.content.Context
+          import android.os.SystemClock
+          import java.io.File
+
+          object SpeedLimiter {
+              private const val FILE_NAME = "speed_limit_kbps.txt"
+              private const val REFRESH_MS = 1000L
+
+              private val lock = Any()
+              @Volatile private var limitBps = 0L
+              @Volatile private var lastRead = 0L
+              @Volatile private var appCtx: Context? = null
+              private var nextFreeNs = 0L
+
+              private fun filesDir(): File? {
+                  appCtx?.let { c -> c.filesDir?.let { return it } }
+                  try {
+                      val app = Class.forName("android.app.ActivityThread")
+                          .getMethod("currentApplication").invoke(null) as? Application
+                      if (app != null) {
+                          appCtx = app
+                          return app.filesDir
+                      }
+                  } catch (e: Throwable) {
+                  }
+                  try {
+                      val pkg = File("/proc/self/cmdline").readText()
+                          .substringBefore('\u0000').substringBefore(':')
+                      val d = File("/data/data/$pkg/files")
+                      if (pkg.isNotEmpty() && d.isDirectory) return d
+                  } catch (e: Throwable) {
+                  }
+                  return null
+              }
+
+              private fun readKbps(f: File): Long = try {
+                  if (f.exists()) f.readText().trim().toLongOrNull() ?: 0L else 0L
+              } catch (e: Exception) {
+                  0L
+              }
+
+              private fun applyBps(v: Long) {
+                  if (v != limitBps) {
+                      limitBps = v
+                      synchronized(lock) { nextFreeNs = 0L }
+                  }
+              }
+
+              private fun currentLimit(): Long {
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastRead >= REFRESH_MS) {
+                      lastRead = now
+                      val dir = filesDir()
+                      if (dir != null) {
+                          val kbps = readKbps(File(dir, FILE_NAME))
+                          applyBps(if (kbps > 0) kbps * 1024L else 0L)
+                      }
+                  }
+                  return limitBps
+              }
+
+              @JvmStatic
+              fun getKbps(ctx: Context): Long {
+                  appCtx = ctx.applicationContext ?: ctx
+                  return readKbps(File(ctx.filesDir, FILE_NAME))
+              }
+
+              @JvmStatic
+              fun setKbps(ctx: Context, kbps: Long) {
+                  appCtx = ctx.applicationContext ?: ctx
+                  val f = File(ctx.filesDir, FILE_NAME)
+                  try {
+                      if (kbps > 0) f.writeText(kbps.toString()) else f.delete()
+                  } catch (e: Exception) {
+                  }
+                  applyBps(if (kbps > 0) kbps * 1024L else 0L)
+                  lastRead = SystemClock.elapsedRealtime()
+              }
+
+              @JvmStatic
+              fun pass(bytes: Long): Long {
+                  if (bytes > 0) throttle(bytes)
+                  return bytes
+              }
+
+              @JvmStatic
+              fun pass(bytes: Int): Int {
+                  if (bytes > 0) throttle(bytes.toLong())
+                  return bytes
+              }
+
+              // One shared clock for all download threads = total cap
+              private fun throttle(bytes: Long) {
+                  val limit = currentLimit()
+                  if (limit <= 0) return
+                  val waitUntil = synchronized(lock) {
+                      val now = System.nanoTime()
+                      val start = if (nextFreeNs - now > 0) nextFreeNs else now
+                      nextFreeNs = start + bytes * 1_000_000_000L / limit
+                      nextFreeNs
+                  }
+                  while (true) {
+                      val remaining = waitUntil - System.nanoTime()
+                      if (remaining <= 0) return
+                      if (currentLimit() <= 0) return
+                      try {
+                          Thread.sleep(minOf(remaining / 1_000_000L, 200L).coerceAtLeast(1L))
+                      } catch (e: InterruptedException) {
+                          Thread.currentThread().interrupt()
+                          return
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > "$D/SpeedLimitActivity.kt" <<'EOF'
+          package us.shandian.giga.get
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.text.InputFilter
+          import android.text.InputType
+          import android.view.ViewGroup
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class SpeedLimitActivity : Activity() {
+
+              private lateinit var input: EditText
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val density = resources.displayMetrics.density
+                  fun dp(v: Int) = (v * density).toInt()
+                  fun lp(top: Int) = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = dp(top) }
+
+                  val titleView = TextView(this).apply {
+                      text = "Download speed limit"
+                      textSize = 22f
+                  }
+                  val infoView = TextView(this).apply {
+                      text = "Caps the total speed of all NewPipe downloads, in KB/s. " +
+                          "Blank or 0 = unlimited. Applies instantly."
+                      textSize = 14f
+                      alpha = 0.7f
+                  }
+                  input = EditText(this).apply {
+                      hint = "KB/s"
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      filters = arrayOf<InputFilter>(InputFilter.LengthFilter(7))
+                      setSingleLine()
+                      imeOptions = EditorInfo.IME_ACTION_DONE
+                      setOnEditorActionListener { _, actionId, _ ->
+                          if (actionId == EditorInfo.IME_ACTION_DONE) {
+                              save()
+                              true
+                          } else {
+                              false
+                          }
+                      }
+                  }
+                  status = TextView(this).apply { textSize = 15f }
+                  val saveBtn = Button(this).apply {
+                      text = "Save"
+                      setOnClickListener { save() }
+                  }
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(24), dp(24), dp(24), dp(24))
+                      addView(titleView, lp(0))
+                      addView(infoView, lp(8))
+                      addView(input, lp(24))
+                      addView(saveBtn, lp(12))
+                      addView(status, lp(16))
+                  }
+                  val root = FrameLayout(this)
+                  root.fitsSystemWindows = true
+                  root.addView(
+                      col,
+                      FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT
+                      )
+                  )
+                  setContentView(root)
+
+                  val current = SpeedLimiter.getKbps(this)
+                  if (current > 0) input.setText(current.toString())
+                  showStatus(current)
+              }
+
+              private fun save() {
+                  val kbps = input.text.toString().trim().toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+                  SpeedLimiter.setKbps(this, kbps)
+                  if (kbps == 0L) input.setText("")
+                  showStatus(kbps)
+                  getSystemService(InputMethodManager::class.java)
+                      ?.hideSoftInputFromWindow(input.windowToken, 0)
+                  input.clearFocus()
+                  Toast.makeText(
+                      this,
+                      if (kbps > 0) "Limit applied" else "Limit off",
+                      Toast.LENGTH_SHORT
+                  ).show()
+              }
+
+              private fun showStatus(kbps: Long) {
+                  status.text = if (kbps <= 0) {
+                      "Current: unlimited"
+                  } else {
+                      val mb = if (kbps >= 1024) " (" + String.format("%.2f", kbps / 1024.0) + " MB/s)" else ""
+                      "Current: $kbps KB/s" + mb
+                  }
+              }
+          }
+          EOF
+
+          python3 - <<'PY'
+          import re, pathlib, sys
+
+          src = pathlib.Path("newpipe/app/src")
+          FQN = "us.shandian.giga.get.SpeedLimiter.pass"
+
+          def files(name):
+              return [p for p in src.rglob("*")
+                      if p.is_file() and p.name in (name + ".java", name + ".kt")]
+
+          # 1) wrap the progress call in the download read loops: caps all threads
+          call = re.compile(r"\.notifyProgress\(([^;\n]*)\)(\s*;?)")
+          patched = 0
+          for name in ("DownloadRunnable", "DownloadRunnableFallback"):
+              for p in files(name):
+                  t = p.read_text()
+                  t2, n = call.subn(
+                      lambda m: ".notifyProgress(%s(%s))%s" % (FQN, m.group(1), m.group(2)), t)
+                  if n:
+                      p.write_text(t2)
+                      print("patched %s: %d call(s)" % (p.name, n))
+                      patched += n
+
+          # 2) fallback: hook the method itself
+          if patched == 0:
+              print("::warning::call sites not found, hooking DownloadMission.notifyProgress")
+              rxs = [
+                  re.compile(r"(void\s+notifyProgress\s*\(\s*(?:final\s+)?(?:long|int)\s+(\w+)\s*\)\s*\{)"),
+                  re.compile(r"(fun\s+notifyProgress\s*\(\s*(\w+)\s*:\s*(?:Long|Int)\s*\)\s*\{)"),
+              ]
+              for p in files("DownloadMission"):
+                  t = p.read_text()
+                  for rx in rxs:
+                      t, n = rx.subn(
+                          lambda m: "%s\n        %s(%s);" % (m.group(1), FQN, m.group(2)), t)
+                      if n:
+                          p.write_text(t)
+                          print("patched %s method" % p.name)
+                          patched += n
+                          break
+
+          if patched == 0:
+              print("::error::Could not find a place to hook the limiter. Read loops:")
+              for name in ("DownloadRunnable", "DownloadRunnableFallback", "DownloadMission"):
+                  for p in files(name):
+                      for i, line in enumerate(p.read_text().splitlines(), 1):
+                          if "read(" in line or "notifyProgress" in line:
+                              print("%s:%d: %s" % (p.name, i, line.strip()))
+              sys.exit(1)
+
+          # 3) launcher entry for the limit screen (no resource XML touched)
+          man = src / "main" / "AndroidManifest.xml"
+          x = man.read_text()
+          if "SpeedLimitActivity" not in x:
+              assert "</application>" in x, "no </application> in manifest"
+              act = """
+              <activity
+                  android:name="us.shandian.giga.get.SpeedLimitActivity"
+                  android:exported="true"
+                  android:label="NewPipe DL Limit"
+                  android:theme="@android:style/Theme.DeviceDefault.DayNight">
+                  <intent-filter>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent-filter>
+              </activity>
+          """
+              x = x.replace("</application>", act + "    </application>", 1)
+              man.write_text(x)
+              print("manifest patched")
+          PY
+
+          grep -rn "SpeedLimiter" newpipe/app/src --include=*.java --include=*.kt | grep -v "SpeedLimiter.kt" || true
+
+      - name: Build
+        working-directory: newpipe
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir out
+          for f in $(find newpipe/app/build/outputs/apk -name '*.apk'); do
+            cp "$f" "out/NewPipe-${TAG}-speedlimit-$(basename "$f")"
+          done
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NewPipe-${{ env.TAG }}-speedlimit
+          path: out/*.apk
+
+      - name: Publish release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete newpipe-speedlimit --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create newpipe-speedlimit out/*.apk --repo "$GITHUB_REPOSITORY" \
+            --title "NewPipe $TAG + speed limit" --notes "Built from upstream $TAG"
