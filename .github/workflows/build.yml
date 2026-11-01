@@ -76,7 +76,6 @@ jobs:
           cat > "$D/SpeedLimiter.kt" <<'EOF'
           package us.shandian.giga.get
 
-          import android.app.Application
           import android.content.Context
           import android.os.SystemClock
           import java.io.File
@@ -152,7 +151,7 @@ jobs:
                   return bytes
               }
 
-              // Shared clock across all download threads = total cap.
+              // One shared clock for all download threads = total cap.
               // Never blocks if limit is 0. Sleeps in short slices so it
               // stays responsive to limit changes and interrupts.
               private fun throttle(bytes: Long) {
@@ -297,7 +296,6 @@ jobs:
 
           src = pathlib.Path("newpipe/app/src")
           FQN = "us.shandian.giga.get.SpeedLimiter.pass"
-          MAIN_ACT = pathlib.Path("newpipe/app/src/main/java/org/schabi/newpipe/MainActivity.java")
 
           def files(name):
               return [p for p in src.rglob("*")
@@ -305,45 +303,33 @@ jobs:
 
           patched_total = 0
 
-          # Throttle at the read() call site. Match:
-          #   int read = in.read(buffer);        (Java)
-          #   val read = in.read(buffer)         (Kotlin)
-          # We wrap only the assigned read value. This keeps notifyProgress
-          # and queue lifecycle completely untouched.
-          read_assign_java = re.compile(
-              r"(\b(?:int|long|final\s+int|final\s+long)\s+(\w+)\s*=\s*[^;\n]*?\.read\s*\([^;\n]*\)\s*;)"
-          )
-          read_assign_kt = re.compile(
-              r"(\b(?:val|var)\s+(\w+)\s*(?::\s*(?:Int|Long))?\s*=\s*[^\n]*?\.read\s*\([^\n]*\)\s*)"
+          # Match a whole `while (...) {` whose condition contains an inline
+          # `(var = something.read(...))` assignment. Both the current
+          # DownloadRunnable and DownloadRunnableFallback use this form:
+          #   while (start <= end && mMission.running &&
+          #          (len = is.read(buf, 0, buf.length)) != -1) {
+          while_read = re.compile(
+              r"(while\s*\(.*?\(\s*(?:\w+\s*)?(\w+)\s*=\s*[\w.]*\.read\s*\([^)]*\)\s*\).*?\)\s*\{)",
+              re.S,
           )
 
           for name in ("DownloadRunnable", "DownloadRunnableFallback"):
               for p in files(name):
                   t = p.read_text()
-                  orig = t
 
-                  def jrepl(m):
-                      stmt, var = m.group(1), m.group(2)
-                      # insert pass() right after the assignment
-                      return stmt + "\n        %s(%s);" % (FQN, var)
+                  def repl(m):
+                      header, var = m.group(1), m.group(2)
+                      if FQN in header:
+                          return header
+                      return header + "\n                %s(%s);" % (FQN, var)
 
-                  t, n1 = read_assign_java.subn(jrepl, t)
-
-                  def krepl(m):
-                      stmt, var = m.group(1), m.group(2)
-                      return stmt + "\n        %s(%s)" % (FQN, var)
-
-                  if p.suffix == ".kt":
-                      # kotlin: run kt pattern only
-                      t = orig
-                      t, n1 = read_assign_kt.subn(krepl, t)
-
-                  if n1:
-                      p.write_text(t)
-                      print("patched reads in %s: %d" % (p.name, n1))
-                      patched_total += n1
+                  t2, n = while_read.subn(repl, t)
+                  if n and t2 != t:
+                      p.write_text(t2)
+                      print("patched read loop in %s: %d site(s)" % (p.name, n))
+                      patched_total += n
                   else:
-                      print("no read assignment matched in %s" % p.name)
+                      print("no while-with-read matched in %s" % p.name)
 
           if patched_total == 0:
               print("::error::Could not find read() call sites to throttle. Dumping context:")
