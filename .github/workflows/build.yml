@@ -73,6 +73,7 @@ jobs:
           D=newpipe/app/src/main/java/us/shandian/giga/get
           mkdir -p "$D"
 
+          # --- SpeedLimiter: shared throttle clock across all threads ---
           cat > "$D/SpeedLimiter.kt" <<'EOF'
           package us.shandian.giga.get
 
@@ -90,10 +91,7 @@ jobs:
               @Volatile private var appCtx: Context? = null
               private var nextFreeNs = 0L
 
-              private fun filesDir(): File? {
-                  appCtx?.let { c -> c.filesDir?.let { return it } }
-                  return null
-              }
+              private fun filesDir(): File? = appCtx?.filesDir
 
               private fun readKbps(f: File): Long = try {
                   if (f.exists()) f.readText().trim().toLongOrNull() ?: 0L else 0L
@@ -140,20 +138,17 @@ jobs:
               }
 
               @JvmStatic
-              fun pass(bytes: Long): Long {
-                  if (bytes > 0) throttle(bytes)
-                  return bytes
-              }
-
-              @JvmStatic
               fun pass(bytes: Int): Int {
                   if (bytes > 0) throttle(bytes.toLong())
                   return bytes
               }
 
-              // One shared clock for all download threads = total cap.
-              // Never blocks if limit is 0. Sleeps in short slices so it
-              // stays responsive to limit changes and interrupts.
+              @JvmStatic
+              fun pass(bytes: Long): Long {
+                  if (bytes > 0) throttle(bytes)
+                  return bytes
+              }
+
               private fun throttle(bytes: Long) {
                   val limit = currentLimit()
                   if (limit <= 0) return
@@ -178,169 +173,92 @@ jobs:
           }
           EOF
 
-          cat > "$D/SpeedLimitActivity.kt" <<'EOF'
+          # --- ThrottlingInputStream: wrap any InputStream, throttle on read ---
+          cat > "$D/ThrottlingInputStream.kt" <<'EOF'
           package us.shandian.giga.get
 
-          import android.app.Activity
-          import android.os.Bundle
-          import android.text.InputFilter
-          import android.text.InputType
-          import android.view.ViewGroup
-          import android.view.inputmethod.EditorInfo
-          import android.view.inputmethod.InputMethodManager
-          import android.widget.Button
-          import android.widget.EditText
-          import android.widget.FrameLayout
-          import android.widget.LinearLayout
-          import android.widget.TextView
-          import android.widget.Toast
+          import java.io.FilterInputStream
+          import java.io.InputStream
 
-          class SpeedLimitActivity : Activity() {
-
-              private lateinit var input: EditText
-              private lateinit var status: TextView
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  val density = resources.displayMetrics.density
-                  fun dp(v: Int) = (v * density).toInt()
-                  fun lp(top: Int) = LinearLayout.LayoutParams(
-                      ViewGroup.LayoutParams.MATCH_PARENT,
-                      ViewGroup.LayoutParams.WRAP_CONTENT
-                  ).apply { topMargin = dp(top) }
-
-                  val titleView = TextView(this).apply {
-                      text = "Download speed limit"
-                      textSize = 22f
-                  }
-                  val infoView = TextView(this).apply {
-                      text = "Caps the total speed of all NewPipe downloads, in KB/s. " +
-                          "Blank or 0 = unlimited. Applies instantly."
-                      textSize = 14f
-                      alpha = 0.7f
-                  }
-                  input = EditText(this).apply {
-                      hint = "KB/s"
-                      inputType = InputType.TYPE_CLASS_NUMBER
-                      filters = arrayOf<InputFilter>(InputFilter.LengthFilter(7))
-                      setSingleLine()
-                      imeOptions = EditorInfo.IME_ACTION_DONE
-                      setOnEditorActionListener { _, actionId, _ ->
-                          if (actionId == EditorInfo.IME_ACTION_DONE) {
-                              save()
-                              true
-                          } else {
-                              false
-                          }
-                      }
-                  }
-                  status = TextView(this).apply { textSize = 15f }
-                  val saveBtn = Button(this).apply {
-                      text = "Save"
-                      setOnClickListener { save() }
-                  }
-
-                  val col = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(dp(24), dp(24), dp(24), dp(24))
-                      addView(titleView, lp(0))
-                      addView(infoView, lp(8))
-                      addView(input, lp(24))
-                      addView(saveBtn, lp(12))
-                      addView(status, lp(16))
-                  }
-                  val root = FrameLayout(this)
-                  root.fitsSystemWindows = true
-                  root.addView(
-                      col,
-                      FrameLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          ViewGroup.LayoutParams.WRAP_CONTENT
-                      )
-                  )
-                  setContentView(root)
-
-                  val current = SpeedLimiter.getKbps(this)
-                  if (current > 0) input.setText(current.toString())
-                  showStatus(current)
+          class ThrottlingInputStream(inner: InputStream) : FilterInputStream(inner) {
+              override fun read(): Int {
+                  val b = super.read()
+                  if (b >= 0) SpeedLimiter.pass(1)
+                  return b
               }
 
-              private fun save() {
-                  val kbps = input.text.toString().trim().toLongOrNull()?.coerceAtLeast(0L) ?: 0L
-                  SpeedLimiter.setKbps(this, kbps)
-                  if (kbps == 0L) input.setText("")
-                  showStatus(kbps)
-                  getSystemService(InputMethodManager::class.java)
-                      ?.hideSoftInputFromWindow(input.windowToken, 0)
-                  input.clearFocus()
-                  Toast.makeText(
-                      this,
-                      if (kbps > 0) "Limit applied" else "Limit off",
-                      Toast.LENGTH_SHORT
-                  ).show()
+              override fun read(b: ByteArray, off: Int, len: Int): Int {
+                  val n = super.read(b, off, len)
+                  if (n > 0) SpeedLimiter.pass(n)
+                  return n
               }
 
-              private fun showStatus(kbps: Long) {
-                  status.text = if (kbps <= 0) {
-                      "Current: unlimited"
-                  } else {
-                      val mb = if (kbps >= 1024) " (" + String.format("%.2f", kbps / 1024.0) + " MB/s)" else ""
-                      "Current: $kbps KB/s" + mb
-                  }
+              override fun skip(n: Long): Long {
+                  val s = super.skip(n)
+                  if (s > 0) SpeedLimiter.pass(s.toInt())
+                  return s
               }
           }
           EOF
 
+          # --- Wire the wrapper into the two download runnables ---
           python3 - <<'PY'
           import re, pathlib, sys
 
           src = pathlib.Path("newpipe/app/src")
-          FQN = "us.shandian.giga.get.SpeedLimiter.pass"
 
           def files(name):
               return [p for p in src.rglob("*")
                       if p.is_file() and p.name in (name + ".java", name + ".kt")]
 
-          patched_total = 0
-
-          # Match a whole `while (...) {` whose condition contains an inline
-          # `(var = something.read(...))` assignment. Both the current
-          # DownloadRunnable and DownloadRunnableFallback use this form:
-          #   while (start <= end && mMission.running &&
-          #          (len = is.read(buf, 0, buf.length)) != -1) {
-          while_read = re.compile(
-              r"(while\s*\(.*?\(\s*(?:\w+\s*)?(\w+)\s*=\s*[\w.]*\.read\s*\([^)]*\)\s*\).*?\)\s*\{)",
-              re.S,
-          )
-
+          patched = 0
           for name in ("DownloadRunnable", "DownloadRunnableFallback"):
               for p in files(name):
                   t = p.read_text()
+                  orig = t
 
-                  def repl(m):
-                      header, var = m.group(1), m.group(2)
-                      if FQN in header:
-                          return header
-                      return header + "\n                %s(%s);" % (FQN, var)
-
-                  t2, n = while_read.subn(repl, t)
-                  if n and t2 != t:
-                      p.write_text(t2)
-                      print("patched read loop in %s: %d site(s)" % (p.name, n))
-                      patched_total += n
+                  if p.suffix == ".java":
+                      # Match `InputStream is = ...;` / `InputStream mIs = ...;`
+                      # but only when NOT already wrapped.
+                      pat = re.compile(
+                          r"(\b(?:final\s+)?InputStream\s+(\w+)\s*=\s*)([^;]*?)(\s*;)"
+                      )
+                      def repl(m):
+                          if "ThrottlingInputStream" in m.group(3):
+                              return m.group(0)
+                          return (m.group(1)
+                                  + "new us.shandian.giga.get.ThrottlingInputStream("
+                                  + m.group(3).strip() + ")"
+                                  + m.group(4))
+                      t, n = pat.subn(repl, t)
                   else:
-                      print("no while-with-read matched in %s" % p.name)
+                      pat = re.compile(
+                          r"(\b(?:val|var)\s+(\w+)\s*:\s*InputStream\s*=\s*)([^\n]*?)(\s*$)",
+                          re.M,
+                      )
+                      def repl(m):
+                          if "ThrottlingInputStream" in m.group(3):
+                              return m.group(0)
+                          return (m.group(1)
+                                  + "us.shandian.giga.get.ThrottlingInputStream("
+                                  + m.group(3).strip() + ")"
+                                  + m.group(4))
+                      t, n = pat.subn(repl, t)
 
-          if patched_total == 0:
-              print("::error::Could not find read() call sites to throttle. Dumping context:")
+                  if n and t != orig:
+                      p.write_text(t)
+                      print("wrapped InputStream in %s: %d site(s)" % (p.name, n))
+                      patched += n
+
+          if patched == 0:
+              print("::error::Could not find InputStream assignments. Dumping context:")
               for name in ("DownloadRunnable", "DownloadRunnableFallback"):
                   for p in files(name):
                       for i, line in enumerate(p.read_text().splitlines(), 1):
-                          if ".read(" in line:
+                          if "InputStream" in line or ".read(" in line:
                               print("%s:%d: %s" % (p.name, i, line.strip()))
               sys.exit(1)
 
-          # Launcher entry for the limit screen.
           man = src / "main" / "AndroidManifest.xml"
           x = man.read_text()
           if "SpeedLimitActivity" not in x:
@@ -364,15 +282,24 @@ jobs:
           PY
 
           echo "--- verify injection ---"
-          grep -rn "SpeedLimiter.pass" newpipe/app/src --include=*.java --include=*.kt | grep -v "SpeedLimiter.kt" || true
+          grep -rn "ThrottlingInputStream" newpipe/app/src/main/java/us/shandian/giga/get/DownloadRunnable*.java 2>/dev/null || true
+          grep -rn "ThrottlingInputStream" newpipe/app/src/main/java/us/shandian/giga/get/DownloadRunnable*.kt 2>/dev/null || true
 
       - name: Build
         working-directory: newpipe
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Show build error (if failed)
+        if: failure()
+        run: |
+          echo "=== First failure marker ==="
+          grep -n -m1 -A40 -E "FAILURE: Build failed|^e: |error: " newpipe/build.log || tail -n 120 newpipe/build.log
 
       - name: Collect APK
+        if: success()
         run: |
           mkdir out
           for f in $(find newpipe/app/build/outputs/apk -name '*.apk'); do
@@ -381,11 +308,13 @@ jobs:
           ls -la out
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: NewPipe-${{ env.TAG }}-speedlimit
           path: out/*.apk
 
       - name: Publish release
+        if: success()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
