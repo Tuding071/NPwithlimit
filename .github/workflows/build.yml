@@ -15,9 +15,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=$(gh api repos/TeamNewPipe/NewPipe/releases/latest --jq .tag_name || true)
+          TAG=$(gh api repos/TeamNewPipe/NewPipe/releases/latest --jq '.tag_name // empty' 2>/dev/null || true)
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::warning::gh api failed, falling back to git ls-remote"
+            TAG=$(git ls-remote --tags --refs https://github.com/TeamNewPipe/NewPipe.git 'refs/tags/v[0-9]*' \
+                  | sed 's#.*/##' | grep -vE -- '-(rc|beta|alpha|pre)' | sort -V | tail -n1)
+          fi
           if [ -z "$TAG" ]; then
-            TAG=$(git ls-remote --tags --refs https://github.com/TeamNewPipe/NewPipe.git 'v*' | sed 's#.*/##' | sort -V | tail -n1)
+            echo "::error::Could not determine NewPipe tag"
+            exit 1
           fi
           echo "Using NewPipe $TAG"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
@@ -48,7 +54,6 @@ jobs:
           key: gradle-${{ env.TAG }}
           restore-keys: gradle-
 
-      # Same signing key every build so you can update over the previous install
       - uses: actions/cache@v4
         with:
           path: ~/.android/debug.keystore
@@ -88,22 +93,6 @@ jobs:
 
               private fun filesDir(): File? {
                   appCtx?.let { c -> c.filesDir?.let { return it } }
-                  try {
-                      val app = Class.forName("android.app.ActivityThread")
-                          .getMethod("currentApplication").invoke(null) as? Application
-                      if (app != null) {
-                          appCtx = app
-                          return app.filesDir
-                      }
-                  } catch (e: Throwable) {
-                  }
-                  try {
-                      val pkg = File("/proc/self/cmdline").readText()
-                          .substringBefore('\u0000').substringBefore(':')
-                      val d = File("/data/data/$pkg/files")
-                      if (pkg.isNotEmpty() && d.isDirectory) return d
-                  } catch (e: Throwable) {
-                  }
                   return null
               }
 
@@ -163,7 +152,9 @@ jobs:
                   return bytes
               }
 
-              // One shared clock for all download threads = total cap
+              // Shared clock across all download threads = total cap.
+              // Never blocks if limit is 0. Sleeps in short slices so it
+              // stays responsive to limit changes and interrupts.
               private fun throttle(bytes: Long) {
                   val limit = currentLimit()
                   if (limit <= 0) return
@@ -178,7 +169,7 @@ jobs:
                       if (remaining <= 0) return
                       if (currentLimit() <= 0) return
                       try {
-                          Thread.sleep(minOf(remaining / 1_000_000L, 200L).coerceAtLeast(1L))
+                          Thread.sleep(minOf(remaining / 1_000_000L, 100L).coerceAtLeast(1L))
                       } catch (e: InterruptedException) {
                           Thread.currentThread().interrupt()
                           return
@@ -306,52 +297,64 @@ jobs:
 
           src = pathlib.Path("newpipe/app/src")
           FQN = "us.shandian.giga.get.SpeedLimiter.pass"
+          MAIN_ACT = pathlib.Path("newpipe/app/src/main/java/org/schabi/newpipe/MainActivity.java")
 
           def files(name):
               return [p for p in src.rglob("*")
                       if p.is_file() and p.name in (name + ".java", name + ".kt")]
 
-          # 1) wrap the progress call in the download read loops: caps all threads
-          call = re.compile(r"\.notifyProgress\(([^;\n]*)\)(\s*;?)")
-          patched = 0
+          patched_total = 0
+
+          # Throttle at the read() call site. Match:
+          #   int read = in.read(buffer);        (Java)
+          #   val read = in.read(buffer)         (Kotlin)
+          # We wrap only the assigned read value. This keeps notifyProgress
+          # and queue lifecycle completely untouched.
+          read_assign_java = re.compile(
+              r"(\b(?:int|long|final\s+int|final\s+long)\s+(\w+)\s*=\s*[^;\n]*?\.read\s*\([^;\n]*\)\s*;)"
+          )
+          read_assign_kt = re.compile(
+              r"(\b(?:val|var)\s+(\w+)\s*(?::\s*(?:Int|Long))?\s*=\s*[^\n]*?\.read\s*\([^\n]*\)\s*)"
+          )
+
           for name in ("DownloadRunnable", "DownloadRunnableFallback"):
               for p in files(name):
                   t = p.read_text()
-                  t2, n = call.subn(
-                      lambda m: ".notifyProgress(%s(%s))%s" % (FQN, m.group(1), m.group(2)), t)
-                  if n:
-                      p.write_text(t2)
-                      print("patched %s: %d call(s)" % (p.name, n))
-                      patched += n
+                  orig = t
 
-          # 2) fallback: hook the method itself
-          if patched == 0:
-              print("::warning::call sites not found, hooking DownloadMission.notifyProgress")
-              rxs = [
-                  re.compile(r"(void\s+notifyProgress\s*\(\s*(?:final\s+)?(?:long|int)\s+(\w+)\s*\)\s*\{)"),
-                  re.compile(r"(fun\s+notifyProgress\s*\(\s*(\w+)\s*:\s*(?:Long|Int)\s*\)\s*\{)"),
-              ]
-              for p in files("DownloadMission"):
-                  t = p.read_text()
-                  for rx in rxs:
-                      t, n = rx.subn(
-                          lambda m: "%s\n        %s(%s);" % (m.group(1), FQN, m.group(2)), t)
-                      if n:
-                          p.write_text(t)
-                          print("patched %s method" % p.name)
-                          patched += n
-                          break
+                  def jrepl(m):
+                      stmt, var = m.group(1), m.group(2)
+                      # insert pass() right after the assignment
+                      return stmt + "\n        %s(%s);" % (FQN, var)
 
-          if patched == 0:
-              print("::error::Could not find a place to hook the limiter. Read loops:")
-              for name in ("DownloadRunnable", "DownloadRunnableFallback", "DownloadMission"):
+                  t, n1 = read_assign_java.subn(jrepl, t)
+
+                  def krepl(m):
+                      stmt, var = m.group(1), m.group(2)
+                      return stmt + "\n        %s(%s)" % (FQN, var)
+
+                  if p.suffix == ".kt":
+                      # kotlin: run kt pattern only
+                      t = orig
+                      t, n1 = read_assign_kt.subn(krepl, t)
+
+                  if n1:
+                      p.write_text(t)
+                      print("patched reads in %s: %d" % (p.name, n1))
+                      patched_total += n1
+                  else:
+                      print("no read assignment matched in %s" % p.name)
+
+          if patched_total == 0:
+              print("::error::Could not find read() call sites to throttle. Dumping context:")
+              for name in ("DownloadRunnable", "DownloadRunnableFallback"):
                   for p in files(name):
                       for i, line in enumerate(p.read_text().splitlines(), 1):
-                          if "read(" in line or "notifyProgress" in line:
+                          if ".read(" in line:
                               print("%s:%d: %s" % (p.name, i, line.strip()))
               sys.exit(1)
 
-          # 3) launcher entry for the limit screen (no resource XML touched)
+          # Launcher entry for the limit screen.
           man = src / "main" / "AndroidManifest.xml"
           x = man.read_text()
           if "SpeedLimitActivity" not in x:
@@ -361,6 +364,7 @@ jobs:
                   android:name="us.shandian.giga.get.SpeedLimitActivity"
                   android:exported="true"
                   android:label="NewPipe DL Limit"
+                  android:launchMode="singleTask"
                   android:theme="@android:style/Theme.DeviceDefault.DayNight">
                   <intent-filter>
                       <action android:name="android.intent.action.MAIN" />
@@ -373,7 +377,8 @@ jobs:
               print("manifest patched")
           PY
 
-          grep -rn "SpeedLimiter" newpipe/app/src --include=*.java --include=*.kt | grep -v "SpeedLimiter.kt" || true
+          echo "--- verify injection ---"
+          grep -rn "SpeedLimiter.pass" newpipe/app/src --include=*.java --include=*.kt | grep -v "SpeedLimiter.kt" || true
 
       - name: Build
         working-directory: newpipe
@@ -399,6 +404,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete newpipe-speedlimit --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
-          gh release create newpipe-speedlimit out/*.apk --repo "$GITHUB_REPOSITORY" \
-            --title "NewPipe $TAG + speed limit" --notes "Built from upstream $TAG"
+          if gh release view newpipe-speedlimit --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload newpipe-speedlimit out/*.apk --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit newpipe-speedlimit --repo "$GITHUB_REPOSITORY" \
+              --title "NewPipe $TAG + speed limit" \
+              --notes "Built from upstream $TAG"
+          else
+            gh release create newpipe-speedlimit out/*.apk --repo "$GITHUB_REPOSITORY" \
+              --title "NewPipe $TAG + speed limit" --notes "Built from upstream $TAG"
+          fi
